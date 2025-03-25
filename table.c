@@ -48,15 +48,22 @@ u32 rng_u64(PRNG32RomuQuad* rng) {
     return (a << 32) | b;
 }
 
+u8 ymm_entry_cmp(__m256i v, u32 key) {
+    return _mm256_movemask_ps(_mm256_cmpeq_epi32(v, _mm256_set1_epi32(key)));
+}
+
 typedef struct {
     union {
         __m256i kv; // (k)ey (v)ector
         u32 key[8];
     };
     u64 value[8];
-} YmmEntry; // 1.5 cache lines
+} Table1Bucket; // 1.5 cache lines
 
-void dump_ymm_entry(YmmEntry* e) {
+size_t Table1_n_buckets(size_t n_bits) { return ((u64)1) << n_bits; }
+size_t Table1_n_entries(size_t n_bits) { return 8 * Table1_n_buckets(n_bits); }
+
+void Table1Bucket_dump(Table1Bucket* e) {
     printf("k: ");
     for (size_t i = 0; i < 8; i++) { printf("%d ", e->key[i]); }
     printf("\n");
@@ -65,48 +72,40 @@ void dump_ymm_entry(YmmEntry* e) {
     printf("\n");
 }
 
-void dump_ymm_table(YmmEntry* e, size_t n_bits) {
-    size_t size = ((u64)1) << n_bits;
-    for (size_t i = 0; i < size; i++) {
-        dump_ymm_entry(&e[i]);
+void Table1_dump(Table1Bucket* e, size_t n_bits) {
+    for (size_t i = 0; i < Table1_n_buckets(n_bits); i++) {
+        Table1Bucket_dump(&e[i]);
     }
 }
 
-u8 ymm_entry_cmp(YmmEntry* ye, u32 key) {
-    return _mm256_movemask_ps(_mm256_cmpeq_epi32(ye->kv, _mm256_set1_epi32(key)));
-}
-
-// will have 8 * 2^n_bits total entries
-YmmEntry* ymm_table_create(size_t n_bits) {
-    size_t size = ((u64)1) << n_bits;
-    YmmEntry* ret = calloc(size, sizeof(YmmEntry));
+Table1Bucket* Table1_create(size_t n_bits) {
+    Table1Bucket* ret = calloc(Table1_n_buckets(n_bits), sizeof(Table1Bucket));
     assert(ret != NULL);
     return ret;
 }
 
-void ymm_table_reset(YmmEntry* table, size_t n_bits) {
-    size_t size = ((u64)1) << n_bits;
-    for (size_t i = 0; i < size; i++) {
+void Table1_reset(Table1Bucket* table, size_t n_bits) {
+    for (size_t i = 0; i < Table1_n_buckets(n_bits); i++) {
         table[i].kv = _mm256_setzero_si256();
     }
 }
 
-int ymm_table_insert(YmmEntry* table, size_t n_bits, u64 H, u32 key, u64 value) {
+int Table1_insert(Table1Bucket* table, size_t n_bits, u64 H, u32 key, u64 value) {
     size_t bucket = hash1(key, n_bits, H);
-    u8 mask = ymm_entry_cmp(&table[bucket], key);
+    u8 mask = ymm_entry_cmp(table[bucket].kv, key);
     if (mask != 0) { return 1; } // key existed
-    mask = ymm_entry_cmp(&table[bucket], 0);
+    mask = ymm_entry_cmp(table[bucket].kv, 0);
     if (mask == 0) { return 2; } // bucket full
     u8 idx = __builtin_ctz(mask);
     table[bucket].key[idx] = key;
-    assert(__builtin_ctz(ymm_entry_cmp(&table[bucket], key)) == idx);
+    assert(__builtin_ctz(ymm_entry_cmp(table[bucket].kv, key)) == idx);
     table[bucket].value[idx] = value;
     return 0;
 }
 
-int ymm_table_get(YmmEntry* table, size_t n_bits, u64 H, u32 key, u64* value) {
+int Table1_get(Table1Bucket* table, size_t n_bits, u64 H, u32 key, u64* value) {
     size_t bucket = hash1(key, n_bits, H);
-    u8 mask = ymm_entry_cmp(&table[bucket], key);
+    u8 mask = ymm_entry_cmp(table[bucket].kv, key);
     if (mask == 0) { return 1; } // key not found
     u8 idx = __builtin_ctz(mask);
     assert(table[bucket].key[idx] == key);
@@ -114,14 +113,14 @@ int ymm_table_get(YmmEntry* table, size_t n_bits, u64 H, u32 key, u64* value) {
     return 0;
 }
 
-size_t try_table_build(YmmEntry* table, size_t n_bits, u32* keys, size_t target_size, size_t tries, u64* H) {
+size_t Table1_try_build(Table1Bucket* table, size_t n_bits, u32* keys, size_t target_size, size_t tries, u64* H) {
     PRNG32RomuQuad rng;
     size_t try = 0;
     while (try <= tries) {
         try += 1;
         rng_init(&rng, 42 + try);
         u64 Htry = rng_u64(&rng) * 2 + 1;
-        ymm_table_reset(table, n_bits);
+        Table1_reset(table, n_bits);
 
         /*printf("trying H=%ld\n", Htry);*/
 
@@ -130,7 +129,7 @@ size_t try_table_build(YmmEntry* table, size_t n_bits, u32* keys, size_t target_
             u32 key = rng_u32(&rng);
             if (key == 0) continue;
             u64 value = key;
-            int ret = ymm_table_insert(table, n_bits, Htry, key, value);
+            int ret = Table1_insert(table, n_bits, Htry, key, value);
             if (ret == 1) {
                 // key exists
                 continue;
@@ -152,7 +151,7 @@ nexttry:
     return 0;
 }
 
-size_t bsearch_table_occupancy(YmmEntry* table, size_t n_bits, u32* keys, size_t tries, u64* H) {
+size_t Table1_bsearch_occupancy(Table1Bucket* table, size_t n_bits, u32* keys, size_t tries, u64* H) {
     size_t size = ((u64)1) << n_bits;
     size_t size_entries = size * 8;
     size_t lo = 1;
@@ -160,14 +159,14 @@ size_t bsearch_table_occupancy(YmmEntry* table, size_t n_bits, u32* keys, size_t
     while (hi - lo > 1) {
         size_t target_size = lo + (hi-lo)/2;
         printf("lo=%ld hi=%ld trying with target_size %ld\n", lo, hi, target_size);
-        size_t try = try_table_build(table, n_bits, keys, target_size, tries, H);
+        size_t try = Table1_try_build(table, n_bits, keys, target_size, tries, H);
         if (try == 0) { // didn't succeed
             hi = target_size;
         } else {
             lo = target_size;
         }
     }
-    size_t try = try_table_build(table, n_bits, keys, lo, tries, H);
+    size_t try = Table1_try_build(table, n_bits, keys, lo, tries, H);
     assert(try != 0);
     return lo;
 }
@@ -179,24 +178,15 @@ int main() {
     size_t size_entries = size * 8;
     size_t tries = 1000;
 
-    YmmEntry* table = ymm_table_create(n_bits);
+    Table1Bucket* table = Table1_create(n_bits);
     /*u32* keys = calloc(target_size, sizeof(u32));*/
     u32* keys = calloc(size_entries, sizeof(u32));
 
     u64 H = 0;
     /*size_t try = try_table_build(table, n_bits, keys, target_size, tries, &H);*/
-    size_t num_entries = bsearch_table_occupancy(table, n_bits, keys, tries, &H);
+    size_t num_entries = Table1_bsearch_occupancy(table, n_bits, keys, tries, &H);
     printf("got %ld num_entries\n", num_entries);
     size_t try = 1;
-
-    /*if (try == 0) {*/
-    /*    free(table);*/
-    /*    free(keys);*/
-    /*    printf("fail\n");*/
-    /*    return 1;*/
-    /*}*/
-
-    /*dump_ymm_table(table, n_bits);*/
 
     printf("tries = %ld success = %d\n", try, try != 0);
     printf("%ld buckets, %ld entries\n", size, size_entries);
@@ -205,7 +195,7 @@ int main() {
 #ifndef NDEBUG
     for (size_t i = 0; i < num_entries; i++) {
         u64 value;
-        int ret = ymm_table_get(table, n_bits, H, keys[i], &value);
+        int ret = Table1_get(table, n_bits, H, keys[i], &value);
         assert(ret == 0);
         assert((u64)keys[i] == value);
     }
@@ -220,7 +210,7 @@ int main() {
     for (size_t round = 0; round < rounds; round++) {
         for (size_t i = 0; i < num_entries; i++) {
             u64 value;
-            int ret = ymm_table_get(table, n_bits, H, keys[i], &value);
+            int ret = Table1_get(table, n_bits, H, keys[i], &value);
             present |= ret;
             check += value;
         }
