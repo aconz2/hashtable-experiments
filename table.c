@@ -98,7 +98,6 @@ int ymm_table_insert(YmmEntry* table, size_t n_bits, u64 H, u32 key, u64 value) 
     mask = ymm_entry_cmp(&table[bucket], 0);
     if (mask == 0) { return 2; } // bucket full
     u8 idx = __builtin_ctz(mask);
-    /*printf("idx is %d\n", idx);*/
     table[bucket].key[idx] = key;
     assert(__builtin_ctz(ymm_entry_cmp(&table[bucket], key)) == idx);
     table[bucket].value[idx] = value;
@@ -115,22 +114,10 @@ int ymm_table_get(YmmEntry* table, size_t n_bits, u64 H, u32 key, u64* value) {
     return 0;
 }
 
-int main() {
+size_t try_table_build(YmmEntry* table, size_t n_bits, u32* keys, size_t target_size, size_t tries, u64* H) {
     PRNG32RomuQuad rng;
-
-    size_t n_bits = 8;
-    size_t size = ((u64)1) << n_bits;
-    size_t size_entries = size * 8;
-    size_t target_size = 925;
-
-    YmmEntry* table = ymm_table_create(n_bits);
-    u32* keys = calloc(target_size, sizeof(u32));
-
-    int success = 0;
     size_t try = 0;
-    u64 H = 0;
-
-    while (try <= 10000) {
+    while (try <= tries) {
         try += 1;
         rng_init(&rng, 42 + try);
         u64 Htry = rng_u64(&rng) * 2 + 1;
@@ -157,28 +144,66 @@ int main() {
             keys[occupancy] = key;
             occupancy += 1;
         }
-        success = 1;
-        H = Htry;
-        break;
+        *H = Htry;
+        return try;
 nexttry:
         (void)0;
     }
+    return 0;
+}
 
-    if (success == 0) {
-        free(table);
-        free(keys);
-        printf("fail\n");
-        return 1;
+size_t bsearch_table_occupancy(YmmEntry* table, size_t n_bits, u32* keys, size_t tries, u64* H) {
+    size_t size = ((u64)1) << n_bits;
+    size_t size_entries = size * 8;
+    size_t lo = 1;
+    size_t hi = size_entries - 1;
+    while (hi - lo > 1) {
+        size_t target_size = lo + (hi-lo)/2;
+        printf("lo=%ld hi=%ld trying with target_size %ld\n", lo, hi, target_size);
+        size_t try = try_table_build(table, n_bits, keys, target_size, tries, H);
+        if (try == 0) { // didn't succeed
+            hi = target_size;
+        } else {
+            lo = target_size;
+        }
     }
+    size_t try = try_table_build(table, n_bits, keys, lo, tries, H);
+    assert(try != 0);
+    return lo;
+}
+
+int main() {
+
+    size_t n_bits = 8;
+    size_t size = ((u64)1) << n_bits;
+    size_t size_entries = size * 8;
+    size_t tries = 1000;
+
+    YmmEntry* table = ymm_table_create(n_bits);
+    /*u32* keys = calloc(target_size, sizeof(u32));*/
+    u32* keys = calloc(size_entries, sizeof(u32));
+
+    u64 H = 0;
+    /*size_t try = try_table_build(table, n_bits, keys, target_size, tries, &H);*/
+    size_t num_entries = bsearch_table_occupancy(table, n_bits, keys, tries, &H);
+    printf("got %ld num_entries\n", num_entries);
+    size_t try = 1;
+
+    /*if (try == 0) {*/
+    /*    free(table);*/
+    /*    free(keys);*/
+    /*    printf("fail\n");*/
+    /*    return 1;*/
+    /*}*/
 
     /*dump_ymm_table(table, n_bits);*/
 
-    printf("tries = %ld success = %d\n", try, success);
+    printf("tries = %ld success = %d\n", try, try != 0);
     printf("%ld buckets, %ld entries\n", size, size_entries);
-    printf("%.2f occupancy\n", (double)target_size/(double)size_entries);
+    printf("%.2f occupancy\n", (double)num_entries/(double)size_entries);
 
 #ifndef NDEBUG
-    for (size_t i = 0; i < target_size; i++) {
+    for (size_t i = 0; i < num_entries; i++) {
         u64 value;
         int ret = ymm_table_get(table, n_bits, H, keys[i], &value);
         assert(ret == 0);
@@ -193,7 +218,7 @@ nexttry:
 
     clock_ns(&start);
     for (size_t round = 0; round < rounds; round++) {
-        for (size_t i = 0; i < target_size; i++) {
+        for (size_t i = 0; i < num_entries; i++) {
             u64 value;
             int ret = ymm_table_get(table, n_bits, H, keys[i], &value);
             present |= ret;
@@ -202,7 +227,7 @@ nexttry:
     }
     clock_ns(&stop);
 
-    printf("%.2f ns/lookup %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)rounds / (double)target_size, (double)elapsed_ns(start, stop) / 1000000, present, check);
+    printf("%.2f ns/lookup %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)rounds / (double)num_entries, (double)elapsed_ns(start, stop) / 1000000, present, check);
 
 
     free(keys);
