@@ -10,6 +10,8 @@
 
 #define BILLION  1000000000LL
 
+/*#define SEQKEYS*/
+
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint16_t u16;
@@ -26,9 +28,24 @@ static u64 elapsed_ns(Timespec start, Timespec stop) {
 
 // https://arxiv.org/pdf/1504.06804
 // hashes x universally into l<=64 bits using random odd seed a.
-static u64 hash1(u64 x, u64 l, u64 a) {
+u64 hash1(u64 x, u64 l, u64 a) {
+    a = 0x9e3779b97f4a7c15;
     return (a*x) >> (64-l);
+    /*return _bzhi_u64(a * x, l);*/
+    /*return (a*x) & ((1 << l) - 1);*/
+    /*(void)a;*/
+    // multiplying by p turns into a shl and sub
+    /*u64 p = 0xffffffffffff;*/
+    // ANDing seems a bit faster with a bit more collisions (uses bzhi bit zero hi) (uses low bits)
+    /*return ((p*x) ^ a) & ((1 << l) - 1);*/
+    /*return (p*x) & ((1 << l) - 1);*/
+    /*return (a*x) >> (64-l);*/
 }
+
+/*static u64 hash1(u32 x, u64 l, u64 a) {*/
+    /*return _mm_crc32_u32((u32)a, x) >> (32-l);*/
+    /*return _mm_crc32_u32((u32)a, x) & ((1 << l) - 1);*/
+/*}*/
 
 void rng_init(PRNG32RomuQuad* rng, u8 seed) {
     if (seed == 0) { seed += 1; }
@@ -88,7 +105,7 @@ void Table1_dump(Table1Bucket* e, size_t n_bits) {
 }
 
 Table1Bucket* Table1_create(size_t n_bits) {
-    Table1Bucket* ret = calloc(Table1_n_buckets(n_bits), sizeof(Table1Bucket));
+    Table1Bucket* ret = aligned_alloc(32, Table1_n_buckets(n_bits) * sizeof(Table1Bucket));
     assert(ret != NULL);
     return ret;
 }
@@ -122,6 +139,38 @@ int Table1_get(Table1Bucket* table, size_t n_bits, u64 H, u32 key, u64* value) {
     return 0;
 }
 
+int Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H, u32 key[2], u64 value[2]) {
+    size_t bucket[2];
+    u8 mask[4];
+    for (size_t i = 0; i < 2; i++) { bucket[i] = hash1(key[i], n_bits, H); }
+    for (size_t i = 0; i < 2; i++) { mask[i] = ymm_entry_cmp(table[bucket[i]].kv, key[i]); }
+    int ret = 0;
+    for (size_t i = 0; i < 2; i++) {
+        if (mask[i] == 0) {
+            ret |= (1 << i);
+        } else {
+            value[i] = table[bucket[i]].value[__builtin_ctz(mask[i])];
+        }
+    }
+    return ret;
+}
+
+int Table1_get_batch4(Table1Bucket* table, size_t n_bits, u64 H, u32 key[4], u64 value[4]) {
+    size_t bucket[4];
+    u8 mask[4];
+    for (size_t i = 0; i < 4; i++) { bucket[i] = hash1(key[i], n_bits, H); }
+    for (size_t i = 0; i < 4; i++) { mask[i] = ymm_entry_cmp(table[bucket[i]].kv, key[i]); }
+    int ret = 0;
+    for (size_t i = 0; i < 4; i++) {
+        if (mask[i] == 0) {
+            ret |= (1 << i);
+        } else {
+            value[i] = table[bucket[i]].value[__builtin_ctz(mask[i])];
+        }
+    }
+    return ret;
+}
+
 size_t Table1_try_build(Table1Bucket* table, size_t n_bits, u32* keys, size_t target_size, size_t tries, u64* H) {
     PRNG32RomuQuad rng;
     size_t try = 0;
@@ -135,7 +184,11 @@ size_t Table1_try_build(Table1Bucket* table, size_t n_bits, u32* keys, size_t ta
 
         size_t occupancy = 0;
         while (occupancy < target_size) {
+#ifdef SEQKEY
+            u32 key = occupancy + 1;
+#else
             u32 key = rng_u32(&rng);
+#endif
             if (key == 0) continue;
             u64 value = key;
             int ret = Table1_insert(table, n_bits, Htry, key, value);
@@ -167,7 +220,7 @@ size_t Table1_bsearch_occupancy(Table1Bucket* table, size_t n_bits, u32* keys, s
     size_t hi = size_entries - 1;
     while (hi - lo > 1) {
         size_t target_size = lo + (hi-lo)/2;
-        printf("lo=%ld hi=%ld trying with target_size %ld\n", lo, hi, target_size);
+        /*printf("lo=%ld hi=%ld trying with target_size %ld\n", lo, hi, target_size);*/
         size_t try = Table1_try_build(table, n_bits, keys, target_size, tries, H);
         if (try == 0) { // didn't succeed
             hi = target_size;
@@ -176,6 +229,7 @@ size_t Table1_bsearch_occupancy(Table1Bucket* table, size_t n_bits, u32* keys, s
         }
     }
     size_t try = Table1_try_build(table, n_bits, keys, lo, tries, H);
+    (void)try;
     assert(try != 0);
     return lo;
 }
@@ -208,7 +262,7 @@ void Table2_dump(Table2Bucket* e, size_t n_bits) {
 }
 
 Table2Bucket* Table2_create(size_t n_bits) {
-    Table2Bucket* ret = calloc(Table2_n_buckets(n_bits), sizeof(Table2Bucket));
+    Table2Bucket* ret = aligned_alloc(32, Table2_n_buckets(n_bits) * sizeof(Table2Bucket));
     assert(ret != NULL);
     return ret;
 }
@@ -259,7 +313,11 @@ size_t Table2_try_build(Table2Bucket* table, size_t n_bits, u32* keys, size_t ta
 
         size_t occupancy = 0;
         while (occupancy < target_size) {
+#ifdef SEQKEY
+            u32 key = occupancy + 1;
+#else
             u32 key = rng_u32(&rng);
+#endif
             if (key == 0) continue;
             u64 value = key;
             int ret = Table2_insert(table, n_bits, Htry, key, value);
@@ -291,7 +349,7 @@ size_t Table2_bsearch_occupancy(Table2Bucket* table, size_t n_bits, u32* keys, s
     size_t hi = size_entries - 1;
     while (hi - lo > 1) {
         size_t target_size = lo + (hi-lo)/2;
-        printf("lo=%ld hi=%ld trying with target_size %ld\n", lo, hi, target_size);
+        /*printf("lo=%ld hi=%ld trying with target_size %ld\n", lo, hi, target_size);*/
         size_t try = Table2_try_build(table, n_bits, keys, target_size, tries, H);
         if (try == 0) { // didn't succeed
             hi = target_size;
@@ -300,6 +358,7 @@ size_t Table2_bsearch_occupancy(Table2Bucket* table, size_t n_bits, u32* keys, s
         }
     }
     size_t try = Table2_try_build(table, n_bits, keys, lo, tries, H);
+    (void)try;
     assert(try != 0);
     return lo;
 }
@@ -307,11 +366,36 @@ size_t Table2_bsearch_occupancy(Table2Bucket* table, size_t n_bits, u32* keys, s
 // ------------------------------------------------------------------------------------------------------
 
 int main() {
+/*#define NOOP*/
+#ifdef NOOP
+    {
+        PRNG32RomuQuad rng;
+        rng_init(&rng, 42);
+        /*u64 H = rng_u64(&rng);*/
+        u32 H = rng_u32(&rng);
+        for (size_t i = 0; i < 100; i++) {
+            u32 key = rng_u32(&rng);
+            printf("%lx hash=%d\n", key, hash1(key, 8, H));
+        }
+        /*return 0;*/
+    }
+#endif
 
-    size_t tries = 1000;
+#ifndef NDEBUG
+        const size_t rounds = 1000;
+#else
+        const size_t rounds = 10;
+#endif
+
+    size_t tries = 10000;
+    size_t target_size = 1ll << 15;
+    size_t table_1_bits = __builtin_ctz(target_size / 8);
+    size_t table_2_bits = __builtin_ctz(target_size / 16);
+    printf("table_1_bits=%ld table_2_bits=%ld\n", table_1_bits, table_2_bits);
+    printf("-------------\n");
 
     {
-        size_t n_bits = 8;
+        size_t n_bits = table_1_bits;
         size_t n_buckets = Table1_n_buckets(n_bits);
         size_t n_entries = Table1_n_entries(n_bits);
         Table1Bucket* table = Table1_create(n_bits);
@@ -332,37 +416,92 @@ int main() {
         }
 #endif
 
-        u64 check = 0;
-        u64 present = 0;
-        Timespec start, stop;
-        size_t rounds = 10000;
+        {
+            u64 check = 0;
+            u64 present = 0;
+            Timespec start, stop;
 
-        clock_ns(&start);
-        for (size_t round = 0; round < rounds; round++) {
-            for (size_t i = 0; i < got_entries; i++) {
-                u64 value;
-                int ret = Table1_get(table, n_bits, H, keys[i], &value);
-                present |= ret;
-                check += value;
+            clock_ns(&start);
+            for (size_t round = 0; round < rounds; round++) {
+#pragma unroll 1
+                for (size_t i = 0; i < got_entries; i++) {
+                    u64 value;
+                    int ret = Table1_get(table, n_bits, H, keys[i], &value);
+                    present |= ret;
+                    check += value;
+                }
             }
-        }
-        clock_ns(&stop);
+            clock_ns(&stop);
 
-        printf("%.2f ns/lookup %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)rounds / (double)got_entries, (double)elapsed_ns(start, stop) / 1000000, present, check);
+            printf("%.2f ns/lookup %ld lookups (1) %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)rounds / (double)got_entries, rounds * got_entries, (double)elapsed_ns(start, stop) / 1000000, present, check);
+        }
+
+        {
+            u64 check = 0;
+            u64 present = 0;
+            Timespec start, stop;
+            size_t lookups = 0;
+
+            clock_ns(&start);
+            for (size_t round = 0; round < rounds; round++) {
+#pragma unroll 1
+                for (size_t i = 0; i < got_entries - 2; i += 2) {
+                    lookups += 2;
+                    u64 value[2];
+                    u32 k[2] = {keys[i], keys[i + 1]};
+                    int ret = Table1_get_batch2(table, n_bits, H, k, value);
+                    present |= ret;
+                    check += value[0];
+                    check += value[1];
+                }
+            }
+            clock_ns(&stop);
+
+            printf("%.2f ns/lookup %ld lookups (2) %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)lookups, lookups, (double)elapsed_ns(start, stop) / 1000000, present, check);
+        }
+
+        {
+            u64 check = 0;
+            u64 present = 0;
+            Timespec start, stop;
+            size_t lookups = 0;
+
+            clock_ns(&start);
+            for (size_t round = 0; round < rounds; round++) {
+#pragma unroll 1
+                for (size_t i = 0; i < got_entries - 4; i += 4) {
+                    lookups += 4;
+                    u64 value[4];
+                    u32 k[4] = {keys[i], keys[i + 1], keys[i + 2], keys[i + 4]};
+                    int ret = Table1_get_batch4(table, n_bits, H, k, value);
+                    present |= ret;
+                    check += value[0];
+                    check += value[1];
+                    check += value[2];
+                    check += value[3];
+                }
+            }
+            clock_ns(&stop);
+
+            printf("%.2f ns/lookup %ld lookups (4) %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)lookups, lookups, (double)elapsed_ns(start, stop) / 1000000, present, check);
+        }
+
         free(keys);
         free(table);
     }
 
+    printf("-------------\n");
+
     {
-        size_t n_bits = 7;
+        size_t n_bits = table_2_bits;
         size_t n_buckets = Table2_n_buckets(n_bits);
         size_t n_entries = Table2_n_entries(n_bits);
         Table2Bucket* table = Table2_create(n_bits);
         u32* keys = calloc(n_entries, sizeof(u32));
         u64 H = 0;
         size_t got_entries = Table2_bsearch_occupancy(table, n_bits, keys, tries, &H);
-        printf("table1 got %ld num_entries\n", got_entries);
-        printf("table1 %ld buckets, %ld entries\n", n_buckets, n_entries);
+        printf("table2 got %ld num_entries\n", got_entries);
+        printf("table2 %ld buckets, %ld entries\n", n_buckets, n_entries);
         printf("%.2f occupancy\n", (double)got_entries/(double)n_entries);
 
 #ifndef NDEBUG
@@ -377,10 +516,10 @@ int main() {
         u64 check = 0;
         u64 present = 0;
         Timespec start, stop;
-        size_t rounds = 10000;
 
         clock_ns(&start);
         for (size_t round = 0; round < rounds; round++) {
+#pragma unroll 1
             for (size_t i = 0; i < got_entries; i++) {
                 u64 value;
                 int ret = Table2_get(table, n_bits, H, keys[i], &value);
@@ -390,7 +529,7 @@ int main() {
         }
         clock_ns(&stop);
 
-        printf("%.2f ns/lookup %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)rounds / (double)got_entries, (double)elapsed_ns(start, stop) / 1000000, present, check);
+        printf("%.2f ns/lookup %ld lookups %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)rounds / (double)got_entries, rounds * got_entries, (double)elapsed_ns(start, stop) / 1000000, present, check);
         free(keys);
         free(table);
     }
