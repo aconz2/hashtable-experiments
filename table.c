@@ -36,8 +36,15 @@ u64 hash1(u64 x, u64 l, u64 H[2]) {
     /*return (a*x+b) >> (64-l);*/
     /*return ((x + b) * a) >> (64-l);*/
     /*return (x * a) >> (64-l);*/
-    return _bzhi_u64(a * x, l);
-    /*return (a*x) & ((1 << l) - 1);*/
+    /*return _bzhi_u64(a * x, l);*/
+
+    u64 y = (a*x);
+    /*printf("y=%lx\n", y);*/
+    // this mask has target_size_bits - 3 ones and sizeof(Table1Bucket) bits zeros
+    u64 mask = 0b111111111110000000;
+    /*printf("y=%d %d\n", y & mask, (y & mask) >> 7);*/
+    return y & mask;
+    /*return (a*x) & ((1ll << l) - 1);*/
     /*(void)a;*/
     // multiplying by p turns into a shl and sub
     /*u64 p = 0xffffffffffff;*/
@@ -135,7 +142,8 @@ typedef struct {
         __m256i kv; // (k)ey (v)ector
         u32 key[8];
     };
-    u32 value[8];
+    u64 pad[4]; // or insert padding so can compute with shl 0x7
+    u64 value[8];
 } Table1Bucket; // 1.5 cache lines
 
 size_t Table1_n_buckets(size_t n_bits) { return ((u64)1) << n_bits; }
@@ -168,25 +176,28 @@ void Table1_reset(Table1Bucket* table, size_t n_bits) {
 }
 
 int Table1_insert(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key, u64 value) {
-    size_t bucket = hash1(key, n_bits, H);
-    u8 mask = ymm_entry_cmp(table[bucket].kv, key);
+    /*Table1Bucket* bucket = table + hash1(key, n_bits, H);*/
+    Table1Bucket* bucket = (Table1Bucket*)((char*)table + hash1(key, n_bits, H));
+    u8 mask = ymm_entry_cmp(bucket->kv, key);
     if (mask != 0) { return 1; } // key existed
-    mask = ymm_entry_cmp(table[bucket].kv, 0);
+    mask = ymm_entry_cmp(bucket->kv, 0);
     if (mask == 0) { return 2; } // bucket full
     u8 idx = __builtin_ctz(mask);
-    table[bucket].key[idx] = key;
-    assert(__builtin_ctz(ymm_entry_cmp(table[bucket].kv, key)) == idx);
-    table[bucket].value[idx] = value;
+    bucket->key[idx] = key;
+    assert(__builtin_ctz(ymm_entry_cmp(bucket->kv, key)) == idx);
+    bucket->value[idx] = value;
     return 0;
 }
 
 int Table1_get(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key, u64* value) {
-    size_t bucket = hash1(key, n_bits, H);
-    u8 mask = ymm_entry_cmp(table[bucket].kv, key);
+    /*Table1Bucket* bucket = table + hash1(key, n_bits, H);*/
+    // we promise in the hash to have already shifted appropiately
+    Table1Bucket* bucket = (Table1Bucket*)((char*)table + hash1(key, n_bits, H));
+    u8 mask = ymm_entry_cmp(bucket->kv, key);
     if (mask == 0) { return 1; } // key not found
     u8 idx = __builtin_ctz(mask);
-    assert(table[bucket].key[idx] == key);
-    *value = table[bucket].value[idx];
+    assert(bucket->key[idx] == key);
+    *value = bucket->value[idx];
     return 0;
 }
 
@@ -525,7 +536,7 @@ int main() {
             printf("%.2f ns/lookup %ld lookups (1) %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)rounds / (double)got_entries, rounds * got_entries, (double)elapsed_ns(start, stop) / 1000000, present, check);
         }
 
-        {
+        if (0) {
             u64 check = 0;
             u64 present = 0;
             Timespec start, stop;
@@ -549,7 +560,7 @@ int main() {
             printf("%.2f ns/lookup %ld lookups (2) %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)lookups, lookups, (double)elapsed_ns(start, stop) / 1000000, present, check);
         }
 
-        {
+        if (0) {
             u64 check = 0;
             u64 present = 0;
             Timespec start, stop;
