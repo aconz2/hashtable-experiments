@@ -11,6 +11,7 @@
 #define BILLION  1000000000LL
 
 /*#define SEQKEYS*/
+/*#define HASHMASK*/
 
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -38,13 +39,19 @@ u64 hash1(u64 x, u64 l, u64 H[2]) {
     /*return (x * a) >> (64-l);*/
     /*return _bzhi_u64(a * x, l);*/
 
-    u64 y = (a*x);
+    u64 y = a*x;
+#ifdef HASHMASK
+    // WARN 7 is ctz(sizeof(Table1Bucket))
+    u64 mask = ((1ll << l) - 1) << 7;
+    return y & mask;
+#else
+    return y >> (64 - l);
+#endif
+    /*u64 y = (a*x+b);*/
     /*printf("y=%lx\n", y);*/
     // this mask has target_size_bits - 3 ones and sizeof(Table1Bucket) bits zeros
     /*u64 mask = 0b111111111110000000;*/
-    u64 mask = ((1ll << l) - 1) << 7;
     /*printf("y=%d %d\n", y & mask, (y & mask) >> 7);*/
-    return y & mask;
     /*return (a*x) & ((1ll << l) - 1);*/
     /*(void)a;*/
     // multiplying by p turns into a shl and sub
@@ -177,8 +184,11 @@ void Table1_reset(Table1Bucket* table, size_t n_bits) {
 }
 
 int Table1_insert(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key, u64 value) {
-    /*Table1Bucket* bucket = table + hash1(key, n_bits, H);*/
+#ifdef HASHMASK
     Table1Bucket* bucket = (Table1Bucket*)((char*)table + hash1(key, n_bits, H));
+#else
+    Table1Bucket* bucket = table + hash1(key, n_bits, H);
+#endif
     u8 mask = ymm_entry_cmp(bucket->kv, key);
     if (mask != 0) { return 1; } // key existed
     mask = ymm_entry_cmp(bucket->kv, 0);
@@ -191,9 +201,11 @@ int Table1_insert(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key, u64 val
 }
 
 int Table1_get(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key, u64* value) {
-    /*Table1Bucket* bucket = table + hash1(key, n_bits, H);*/
-    // we promise in the hash to have already shifted appropiately
+#ifdef HASHMASK
     Table1Bucket* bucket = (Table1Bucket*)((char*)table + hash1(key, n_bits, H));
+#else
+    Table1Bucket* bucket = table + hash1(key, n_bits, H);
+#endif
     u8 mask = ymm_entry_cmp(bucket->kv, key);
     if (mask == 0) { return 1; } // key not found
     u8 idx = __builtin_ctz(mask);
@@ -203,11 +215,15 @@ int Table1_get(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key, u64* value
 }
 
 int Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[2], u64 value[2]) {
-#define IMPL1
+/*#define IMPL1*/
 #ifdef IMPL1
     Table1Bucket* bucket[2];
     u8 mask[2];
+#ifdef HASHMASK
     for (size_t i = 0; i < 2; i++) { bucket[i] = (Table1Bucket*)((char*)table + hash1(key[i], n_bits, H)); }
+#else
+    for (size_t i = 0; i < 2; i++) { bucket[i] = table + hash1(key[i], n_bits, H); }
+#endif
     for (size_t i = 0; i < 2; i++) { mask[i] = ymm_entry_cmp(bucket[i]->kv, key[i]); }
     int ret = 0;
     for (size_t i = 0; i < 2; i++) {
@@ -223,8 +239,14 @@ int Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[2], 
     // this does worse! I think because we increase the latency to loading the first bucket
     // since we can do work for the second one while the load for the first happens
     u8 mask[2];
+#ifdef HASHMASK
     Table1Bucket* bucket0 = (Table1Bucket*)((char*)table + hash1(key[0], n_bits, H));
     Table1Bucket* bucket1 = (Table1Bucket*)((char*)table + hash1(key[1], n_bits, H));
+#else
+    Table1Bucket* bucket0 = table + hash1(key[0], n_bits, H);
+    Table1Bucket* bucket1 = table + hash1(key[1], n_bits, H);
+#endif
+
     __m256 kv0 = _mm256_set1_epi32(key[0]);
     mask[0] = _mm256_movemask_ps(_mm256_cmpeq_epi32(bucket0->kv, kv0));
     __m256 kv1 = _mm256_set1_epi32(key[1]);
@@ -247,7 +269,11 @@ int Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[2], 
 int Table1_get_batch4(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[4], u64 value[4]) {
     Table1Bucket* bucket[4];
     u8 mask[4];
+#ifdef HASHMASK
     for (size_t i = 0; i < 4; i++) { bucket[i] = (Table1Bucket*)((char*)table + hash1(key[i], n_bits, H)); }
+#else
+    for (size_t i = 0; i < 4; i++) { bucket[i] = table + hash1(key[i], n_bits, H); }
+#endif
     for (size_t i = 0; i < 4; i++) { mask[i] = ymm_entry_cmp(bucket[i]->kv, key[i]); }
     int ret = 0;
     for (size_t i = 0; i < 4; i++) {
@@ -594,6 +620,8 @@ int main() {
     printf("-------------\n");
 
     if (0) {
+        printf("not updated for hashmask\n");
+        return 1;
         size_t n_bits = table_2_bits;
         size_t n_buckets = Table2_n_buckets(n_bits);
         size_t n_entries = Table2_n_entries(n_bits);
