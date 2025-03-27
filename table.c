@@ -202,18 +202,18 @@ int Table1_get(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key, u64* value
 }
 
 int Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[2], u64 value[2]) {
-/*#define IMPL1*/
+#define IMPL1
 #ifdef IMPL1
-    size_t bucket[2];
+    Table1Bucket* bucket[2];
     u8 mask[2];
-    for (size_t i = 0; i < 2; i++) { bucket[i] = hash1(key[i], n_bits, H); }
-    for (size_t i = 0; i < 2; i++) { mask[i] = ymm_entry_cmp(table[bucket[i]].kv, key[i]); }
+    for (size_t i = 0; i < 2; i++) { bucket[i] = (Table1Bucket*)((char*)table + hash1(key[i], n_bits, H)); }
+    for (size_t i = 0; i < 2; i++) { mask[i] = ymm_entry_cmp(bucket[i]->kv, key[i]); }
     int ret = 0;
     for (size_t i = 0; i < 2; i++) {
         if (mask[i] == 0) {
             ret |= (1 << i);
         } else {
-            value[i] = table[bucket[i]].value[__builtin_ctz(mask[i])];
+            value[i] = bucket[i]->value[__builtin_ctz(mask[i])];
         }
     }
     return ret;
@@ -222,8 +222,8 @@ int Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[2], 
     // this does worse! I think because we increase the latency to loading the first bucket
     // since we can do work for the second one while the load for the first happens
     u8 mask[2];
-    Table1Bucket* bucket0 = table + hash1(key[0], n_bits, H);
-    Table1Bucket* bucket1 = table + hash1(key[1], n_bits, H);
+    Table1Bucket* bucket0 = (Table1Bucket*)((char*)table + hash1(key[0], n_bits, H));
+    Table1Bucket* bucket1 = (Table1Bucket*)((char*)table + hash1(key[1], n_bits, H));
     __m256 kv0 = _mm256_set1_epi32(key[0]);
     mask[0] = _mm256_movemask_ps(_mm256_cmpeq_epi32(bucket0->kv, kv0));
     __m256 kv1 = _mm256_set1_epi32(key[1]);
@@ -244,16 +244,16 @@ int Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[2], 
 }
 
 int Table1_get_batch4(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[4], u64 value[4]) {
-    size_t bucket[4];
+    Table1Bucket* bucket[4];
     u8 mask[4];
-    for (size_t i = 0; i < 4; i++) { bucket[i] = hash1(key[i], n_bits, H); }
-    for (size_t i = 0; i < 4; i++) { mask[i] = ymm_entry_cmp(table[bucket[i]].kv, key[i]); }
+    for (size_t i = 0; i < 4; i++) { bucket[i] = (Table1Bucket*)((char*)table + hash1(key[i], n_bits, H)); }
+    for (size_t i = 0; i < 4; i++) { mask[i] = ymm_entry_cmp(bucket[i]->kv, key[i]); }
     int ret = 0;
     for (size_t i = 0; i < 4; i++) {
         if (mask[i] == 0) {
             ret |= (1 << i);
         } else {
-            value[i] = table[bucket[i]].value[__builtin_ctz(mask[i])];
+            value[i] = bucket[i]->value[__builtin_ctz(mask[i])];
         }
     }
     return ret;
@@ -536,7 +536,7 @@ int main() {
             printf("%.2f ns/lookup %ld lookups (1) %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)rounds / (double)got_entries, rounds * got_entries, (double)elapsed_ns(start, stop) / 1000000, present, check);
         }
 
-        if (0) {
+        {
             u64 check = 0;
             u64 present = 0;
             Timespec start, stop;
@@ -560,7 +560,7 @@ int main() {
             printf("%.2f ns/lookup %ld lookups (2) %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)lookups, lookups, (double)elapsed_ns(start, stop) / 1000000, present, check);
         }
 
-        if (0) {
+        {
             u64 check = 0;
             u64 present = 0;
             Timespec start, stop;
