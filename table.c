@@ -36,8 +36,8 @@ u64 hash1(u64 x, u64 l, u64 H[2]) {
     /*return (a*x+b) >> (64-l);*/
     /*return ((x + b) * a) >> (64-l);*/
     /*return (x * a) >> (64-l);*/
-    /*return _bzhi_u64(a * x, l);*/
-    return (a*x) & ((1 << l) - 1);
+    return _bzhi_u64(a * x, l);
+    /*return (a*x) & ((1 << l) - 1);*/
     /*(void)a;*/
     // multiplying by p turns into a shl and sub
     /*u64 p = 0xffffffffffff;*/
