@@ -41,7 +41,8 @@ u64 hash1(u64 x, u64 l, u64 H[2]) {
     u64 y = (a*x);
     /*printf("y=%lx\n", y);*/
     // this mask has target_size_bits - 3 ones and sizeof(Table1Bucket) bits zeros
-    u64 mask = 0b111111111110000000;
+    /*u64 mask = 0b111111111110000000;*/
+    u64 mask = ((1ll << l) - 1) << 7;
     /*printf("y=%d %d\n", y & mask, (y & mask) >> 7);*/
     return y & mask;
     /*return (a*x) & ((1ll << l) - 1);*/
