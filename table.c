@@ -11,7 +11,7 @@
 #define BILLION  1000000000LL
 
 /*#define SEQKEYS*/
-/*#define HASHMASK*/
+#define HASHMASK
 
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -116,14 +116,14 @@ u64 rng_u64(PRNG32RomuQuad* rng) {
     return (a << 32) | b;
 }
 
-u8 ymm_entry_cmp(__m256i v, u32 key) {
+u32 ymm_entry_cmp(__m256i v, u32 key) {
     return _mm256_movemask_ps(_mm256_cmpeq_epi32(v, _mm256_set1_epi32(key)));
 }
 
-u16 ymm2_entry_cmp(__m256i v[2], u32 key) {
-    u8 ma = ymm_entry_cmp(v[0], key);
-    u8 mb = ymm_entry_cmp(v[1], key);
-    u16 m = (((u16)mb) << 8) | (u16)ma;
+u32 ymm2_entry_cmp(__m256i v[2], u32 key) {
+    u32 ma = ymm_entry_cmp(v[0], key);
+    u32 mb = ymm_entry_cmp(v[1], key);
+    u16 m = mb << 8 | ma;
     return m;
 }
 
@@ -154,6 +154,16 @@ typedef struct {
     u64 value[8];
 } Table1Bucket; // 1.5 cache lines
 
+// we allocate this amount of space at the end so that we can do a load
+// of tzcnt on the mask
+// I thought this would need to be 24, but is still failing in asan
+// 28 works, but 32 is nicer
+// since tzcnt_u32(0) == 32 so from the last bucket we might index value[32]
+// so we should only need an extra 24, but idk
+typedef struct {
+    u64 value[32];
+} Table1Pad;
+
 size_t Table1_n_buckets(size_t n_bits) { return ((u64)1) << n_bits; }
 size_t Table1_n_entries(size_t n_bits) { return 8 * Table1_n_buckets(n_bits); }
 
@@ -172,7 +182,7 @@ void Table1_dump(Table1Bucket* e, size_t n_bits) {
 }
 
 Table1Bucket* Table1_create(size_t n_bits) {
-    Table1Bucket* ret = aligned_alloc(32, Table1_n_buckets(n_bits) * sizeof(Table1Bucket));
+    Table1Bucket* ret = aligned_alloc(32, Table1_n_buckets(n_bits) * sizeof(Table1Bucket) + sizeof(Table1Pad));
     assert(ret != NULL);
     return ret;
 }
@@ -189,11 +199,11 @@ int Table1_insert(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key, u64 val
 #else
     Table1Bucket* bucket = table + hash1(key, n_bits, H);
 #endif
-    u8 mask = ymm_entry_cmp(bucket->kv, key);
+    u32 mask = ymm_entry_cmp(bucket->kv, key);
     if (mask != 0) { return 1; } // key existed
     mask = ymm_entry_cmp(bucket->kv, 0);
     if (mask == 0) { return 2; } // bucket full
-    u8 idx = __builtin_ctz(mask);
+    u32 idx = __builtin_ctz(mask);
     bucket->key[idx] = key;
     assert(__builtin_ctz(ymm_entry_cmp(bucket->kv, key)) == idx);
     bucket->value[idx] = value;
@@ -206,19 +216,23 @@ int Table1_get(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key, u64* value
 #else
     Table1Bucket* bucket = table + hash1(key, n_bits, H);
 #endif
-    u8 mask = ymm_entry_cmp(bucket->kv, key);
-    if (mask == 0) { return 1; } // key not found
-    u8 idx = __builtin_ctz(mask);
-    assert(bucket->key[idx] == key);
-    *value = bucket->value[idx];
-    return 0;
+    /*u32 mask = ymm_entry_cmp(bucket->kv, key);*/
+    /*if (mask == 0) { return 1; } // key not found*/
+    /*u32 idx = __builtin_ctz(mask);*/
+    /*assert(bucket->key[idx] == key);*/
+    /**value = bucket->value[idx];*/
+    /*return 0;*/
+
+    u32 i = _tzcnt_u32(ymm_entry_cmp(bucket->kv, key));
+    value[0] = bucket->value[i]; // might read garbage
+    return i >> 5; // if i == 32, this ors in a 1, but if in 0-7, ors in a zero
 }
 
 int Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[2], u64 value[2]) {
 /*#define IMPL1*/
 #ifdef IMPL1
     Table1Bucket* bucket[2];
-    u8 mask[2];
+    u32 mask[2];
 #ifdef HASHMASK
     for (size_t i = 0; i < 2; i++) { bucket[i] = (Table1Bucket*)((char*)table + hash1(key[i], n_bits, H)); }
 #else
@@ -238,37 +252,54 @@ int Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[2], 
 #else
     // this does worse! I think because we increase the latency to loading the first bucket
     // since we can do work for the second one while the load for the first happens
-    u8 mask[2];
+    u32 mask[2];
 #ifdef HASHMASK
     Table1Bucket* bucket0 = (Table1Bucket*)((char*)table + hash1(key[0], n_bits, H));
+    mask[0] = _mm256_movemask_ps(_mm256_cmpeq_epi32(bucket0->kv, _mm256_set1_epi32(key[0])));
     Table1Bucket* bucket1 = (Table1Bucket*)((char*)table + hash1(key[1], n_bits, H));
+    mask[1] = _mm256_movemask_ps(_mm256_cmpeq_epi32(bucket1->kv, _mm256_set1_epi32(key[1])));
 #else
     Table1Bucket* bucket0 = table + hash1(key[0], n_bits, H);
     Table1Bucket* bucket1 = table + hash1(key[1], n_bits, H);
-#endif
-
     __m256 kv0 = _mm256_set1_epi32(key[0]);
     mask[0] = _mm256_movemask_ps(_mm256_cmpeq_epi32(bucket0->kv, kv0));
     __m256 kv1 = _mm256_set1_epi32(key[1]);
     mask[1] = _mm256_movemask_ps(_mm256_cmpeq_epi32(bucket1->kv, kv1));
+#endif
+
     int ret = 0;
-    if (mask[0] == 0) {
-        ret |= 1;
-    } else {
-        value[0] = bucket0->value[__builtin_ctz(mask[0])];
-    }
-    if (mask[1] == 0) {
-        ret |= 2;
-    } else {
-        value[1] = bucket1->value[__builtin_ctz(mask[1])];
-    }
+    /*if (mask[0] == 0) {*/
+    /*    ret |= 1;*/
+    /*} else {*/
+    /*    value[0] = bucket0->value[__builtin_ctz(mask[0])];*/
+    /*}*/
+    /*if (mask[1] == 0) {*/
+    /*    ret |= 2;*/
+    /*} else {*/
+    /*    value[1] = bucket1->value[__builtin_ctz(mask[1])];*/
+    /*}*/
+
+    u32 i;
+    i = _tzcnt_u32(mask[0]);
+    value[0] = bucket0->value[i]; // might read garbage
+    ret |= i >> 5; // if i == 32, this ors in a 1, but if in 0-7, ors in a zero
+    i = _tzcnt_u32(mask[1]);
+    value[1] = bucket1->value[i]; // might read garbage
+    ret |= i >> 4; // if i == 32, this ors in a 2, but if in 0-7, ors in a zero
+
     return ret;
+#endif
+
+#ifdef IMPL1
+#undef IMPL1
 #endif
 }
 
 int Table1_get_batch4(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[4], u64 value[4]) {
+/*#define IMPL1*/
+#ifdef IMPL1
     Table1Bucket* bucket[4];
-    u8 mask[4];
+    u32 mask[4];
 #ifdef HASHMASK
     for (size_t i = 0; i < 4; i++) { bucket[i] = (Table1Bucket*)((char*)table + hash1(key[i], n_bits, H)); }
 #else
@@ -276,14 +307,83 @@ int Table1_get_batch4(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[4], 
 #endif
     for (size_t i = 0; i < 4; i++) { mask[i] = ymm_entry_cmp(bucket[i]->kv, key[i]); }
     int ret = 0;
+    /*for (size_t i = 0; i < 4; i++) {*/
+    /*    if (mask[i] == 0) {*/
+    /*        ret |= (1 << i);*/
+    /*    } else {*/
+    /*        value[i] = bucket[i]->value[__builtin_ctz(mask[i])];*/
+    /*    }*/
+    /*}*/
+
     for (size_t i = 0; i < 4; i++) {
-        if (mask[i] == 0) {
-            ret |= (1 << i);
+        u32 idx = _tzcnt_u32(mask[i]);
+        value[i] = bucket[i]->value[idx];
+        if (i == 3) {
+            ret |= idx == 32 ? 8 : 0;
         } else {
-            value[i] = bucket[i]->value[__builtin_ctz(mask[i])];
+            ret |= idx >> (5 - i);
         }
     }
     return ret;
+#else
+
+    int ret = 0;
+    u32 i;
+    Table1Bucket* b0, *b1, *b2, *b3;
+    __m256 c0, c1, c2, c3;
+
+    b0 = (Table1Bucket*)((char*)table + hash1(key[0], n_bits, H));
+    b1 = (Table1Bucket*)((char*)table + hash1(key[1], n_bits, H));
+
+    c0 =_mm256_cmpeq_epi32(b0->kv, _mm256_set1_epi32(key[0]));
+    c1 =_mm256_cmpeq_epi32(b1->kv, _mm256_set1_epi32(key[1]));
+
+    i = _tzcnt_u32(_mm256_movemask_ps(c0));
+    value[0] = b0->value[i];
+    ret |= i >> 5;
+
+    i = _tzcnt_u32(_mm256_movemask_ps(c1));
+    value[1] = b1->value[i];
+    ret |= i >> 4;
+
+    b2 = (Table1Bucket*)((char*)table + hash1(key[2], n_bits, H));
+    b3 = (Table1Bucket*)((char*)table + hash1(key[3], n_bits, H));
+
+    c2 =_mm256_cmpeq_epi32(b2->kv, _mm256_set1_epi32(key[2]));
+    c3 =_mm256_cmpeq_epi32(b3->kv, _mm256_set1_epi32(key[3]));
+
+    i = _tzcnt_u32(_mm256_movemask_ps(c2));
+    value[2] = b2->value[i];
+    ret |= i >> 3;
+
+    i = _tzcnt_u32(_mm256_movemask_ps(c3));
+    value[3] = b2->value[i];
+    ret |= i == 32 ? 8 : 0;
+
+
+    /*u32 mask, i;*/
+    /*mask = _mm256_movemask_ps(c0); i = _tzcnt_u32(mask);*/
+    /*if (mask == 0) { ret |= 1; } else { value[0] = b0->value[i]; }*/
+    /**/
+    /*mask = _mm256_movemask_ps(c1); i = _tzcnt_u32(mask);*/
+    /*if (mask == 0) { ret |= 2; } else { value[1] = b1->value[i]; }*/
+    /**/
+    /*mask = _mm256_movemask_ps(c1); i = _tzcnt_u32(mask);*/
+    /*if (mask == 0) { ret |= 4; } else { value[2] = b2->value[i]; }*/
+    /**/
+    /*mask = _mm256_movemask_ps(c1); i = _tzcnt_u32(mask);*/
+    /*if (mask == 0) { ret |= 8; } else { value[3] = b3->value[i]; }*/
+
+
+
+
+    return ret;
+
+#endif
+
+#ifdef IMPL1
+#undef IMPL1
+#endif
 }
 
 size_t Table1_try_build(Table1Bucket* table, size_t n_bits, u32* keys, size_t target_size, size_t tries, u64* H) {
@@ -395,14 +495,14 @@ void Table2_reset(Table2Bucket* table, size_t n_bits) {
 
 int Table2_insert(Table2Bucket* table, size_t n_bits, u64 H[2], u32 key, u64 value) {
     size_t bucket = hash1(key, n_bits, H);
-    u8 ma = ymm_entry_cmp(table[bucket].kv[0], key);
-    u8 mb = ymm_entry_cmp(table[bucket].kv[1], key);
+    u32 ma = ymm_entry_cmp(table[bucket].kv[0], key);
+    u32 mb = ymm_entry_cmp(table[bucket].kv[1], key);
     if (ma != 0 || mb != 0) { return 1; } // key existed
     ma = ymm_entry_cmp(table[bucket].kv[0], 0);
     mb = ymm_entry_cmp(table[bucket].kv[1], 0);
     if (ma == 0 && mb == 0) { return 2; } // bucket full
-    u16 m = (((u16)mb) << 8) | (u16)ma;
-    u8 idx = __builtin_ctz(m);
+    u32 m = (((u32)mb) << 8) | (u32)ma;
+    u32 idx = __builtin_ctz(m);
     table[bucket].key[idx] = key;
     assert(__builtin_ctz(ymm2_entry_cmp(table[bucket].kv, key)) == idx);
     table[bucket].value[idx] = value;
@@ -411,9 +511,9 @@ int Table2_insert(Table2Bucket* table, size_t n_bits, u64 H[2], u32 key, u64 val
 
 int Table2_get(Table2Bucket* table, size_t n_bits, u64 H[2], u32 key, u64* value) {
     size_t bucket = hash1(key, n_bits, H);
-    u16 mask = ymm2_entry_cmp(table[bucket].kv, key);
+    u32 mask = ymm2_entry_cmp(table[bucket].kv, key);
     if (mask == 0) { return 1; } // key not found
-    u8 idx = __builtin_ctz(mask);
+    u32 idx = __builtin_ctz(mask);
     assert(table[bucket].key[idx] == key);
     *value = table[bucket].value[idx];
     return 0;
@@ -508,7 +608,7 @@ int main() {
     printf("alignof(Table2Bucket) = %ld\n", _Alignof(Table2Bucket));
 
 #ifndef NDEBUG
-        const size_t rounds = 2000;
+        const size_t rounds = 8000;
 #else
         const size_t rounds = 10;
 #endif
@@ -541,6 +641,19 @@ int main() {
             assert(ret == 0);
             assert((u64)keys[i] == value);
         }
+        // test a non-existant key
+        u32 U32_MAX = -1;
+        size_t n_missing = 100000;
+        for (u32 key = 1; key < U32_MAX; key++) {
+            u64 value;
+            int ret = Table1_get(table, n_bits, H, key, &value);
+            if (ret != 0) {
+                n_missing -= 1;
+                if (n_missing == 0) {
+                    break;
+                }
+            }
+        }
 #endif
 
         {
@@ -549,6 +662,7 @@ int main() {
             Timespec start, stop;
 
             clock_ns(&start);
+#pragma unroll 1
             for (size_t round = 0; round < rounds; round++) {
 #pragma unroll 1
                 for (size_t i = 0; i < got_entries; i++) {
@@ -570,6 +684,7 @@ int main() {
             size_t lookups = 0;
 
             clock_ns(&start);
+#pragma unroll 1
             for (size_t round = 0; round < rounds; round++) {
 #pragma unroll 1
                 for (size_t i = 0; i < got_entries - 2; i += 2) {
@@ -594,6 +709,7 @@ int main() {
             size_t lookups = 0;
 
             clock_ns(&start);
+#pragma unroll 1
             for (size_t round = 0; round < rounds; round++) {
 #pragma unroll 1
                 for (size_t i = 0; i < got_entries - 4; i += 4) {
