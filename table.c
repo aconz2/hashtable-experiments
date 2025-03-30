@@ -211,44 +211,88 @@ int Table1_insert(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key, u64 val
     return 0;
 }
 
-int Table1_get(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key, u64* value) {
+u8 Table1_get(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key, u64* value) {
 #ifdef HASHMASK
     Table1Bucket* bucket = (Table1Bucket*)((char*)table + hash1(key, n_bits, H));
 #else
     Table1Bucket* bucket = table + hash1(key, n_bits, H);
 #endif
-    /*u32 mask = ymm_entry_cmp(bucket->kv, key);*/
-    /*if (mask == 0) { return 1; } // key not found*/
-    /*u32 idx = __builtin_ctz(mask);*/
-    /*assert(bucket->key[idx] == key);*/
-    /**value = bucket->value[idx];*/
-    /*return 0;*/
 
-    /*u32 i = _tzcnt_u32(ymm_entry_cmp(bucket->kv, key));*/
-    /*value[0] = bucket->value[i]; // might read garbage*/
-    /*return i >> 5; // if i == 32, this ors in a 1, but if in 0-7, ors in a zero*/
+#define IMPL3
 
+#ifdef IMPL0
+    u32 mask = ymm_entry_cmp(bucket->kv, key);
+    if (mask == 0) { // key not found
+        *value = 0xff;
+        return 1;
+    }
+    u32 idx = __builtin_ctz(mask);
+    assert(bucket->key[idx] == key);
+    *value = bucket->value[idx];
+    return 0;
+#undef IMPL0
+#endif
+
+    // if we always write a return value, this isn't going to do the best
+#ifdef IMPL1
+    u32 i = _tzcnt_u32(ymm_entry_cmp(bucket->kv, key));
+    value[0] = bucket->value[i]; // might read garbage
+    return i >> 5; // if i == 32, this ors in a 1, but if in 0-7, ors in a zero
+#undef IMPL1
+#endif
+
+// currently the fastest
+#ifdef IMPL2
     u32 cmp = ymm_entry_cmp(bucket->kv, key);
-    /*u32 i = _tzcnt_u32(cmp);*/
     u32 i;
     // jc makes the most logical sense but jb is equivalent and is what clang produces
-    // (I think)
     asm goto (
-            "tzcnt %1, %0\n"
+            "tzcnt %[cmp], %[i]\n"
             "jc %l[carry]"
-            : "=r" (i) // outputs
-            : "r" (cmp) // inputs
+            : [i]"=r" (i) // outputs
+            : [cmp]"r" (cmp) // inputs
             : "cc" // clobbers
             : carry
             );
-    /*if (i == 32) { return 1; }*/
     value[0] = bucket->value[i];
     return 0;
 carry:
+    value[0] = 0xff;
     return 1;
+#undef IMPL2
+#endif
+
+#ifdef IMPL3
+    u64 cmp = ymm_entry_cmp(bucket->kv, key);
+    u64 i;
+    u64 v = 0xff;
+    u8 ret;
+    // have to do a 64 bit tzcnt to then use in the index calculation
+    // unsure how/if the cmov is actually correct, since the asm looks like
+    //   vpvmpeqd  ymm0, ymm0, [rdi + rax]
+    //   lea       rdx, [rdi + rax] ; this is the bucket (if we pass the value, this becomes rdi + rax + 0x40
+    //   vmovmskps eax, ymm0
+    //   tzcnt     rax, rax
+    //   cmovae    rdx, [rdx + 8*rax + 0x40]
+    //   setb      cl
+    //   movzx     eax, cl
+            // "cmovnc 0x40(%[bucket], %[i], 8), %[v]\n"
+    asm (
+            "tzcntq %[cmp], %[i]\n"
+            "cmovncq 0x40(%[bucket], %[i], 8), %[v]\n"
+            "setc %[ret]"
+            : [i]"=r"(i), [ret]"=r"(ret), [v]"=r"(v) // outputs
+            : [cmp]"r"(cmp), [bucket]"r"(bucket) // inputs
+            : "cc" // clobbers condition code
+            );
+    *value = v;
+    return ret;
+#undef IMPL3
+#endif
+
 }
 
-int Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[2], u64 value[2]) {
+u8 Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[2], u64 value[2]) {
 /*#define IMPL1*/
 #ifdef IMPL1
     Table1Bucket* bucket[2];
@@ -287,7 +331,7 @@ int Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[2], 
     mask[1] = _mm256_movemask_ps(_mm256_cmpeq_epi32(bucket1->kv, kv1));
 #endif
 
-    int ret = 0;
+    u8 ret = 0;
     /*if (mask[0] == 0) {*/
     /*    ret |= 1;*/
     /*} else {*/
@@ -315,7 +359,7 @@ int Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[2], 
 #endif
 }
 
-int Table1_get_batch4(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[4], u64 value[4]) {
+u8 Table1_get_batch4(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[4], u64 value[4]) {
 /*#define IMPL1*/
 #ifdef IMPL1
     Table1Bucket* bucket[4];
@@ -326,7 +370,7 @@ int Table1_get_batch4(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[4], 
     for (size_t i = 0; i < 4; i++) { bucket[i] = table + hash1(key[i], n_bits, H); }
 #endif
     for (size_t i = 0; i < 4; i++) { mask[i] = ymm_entry_cmp(bucket[i]->kv, key[i]); }
-    int ret = 0;
+    u8 ret = 0;
     /*for (size_t i = 0; i < 4; i++) {*/
     /*    if (mask[i] == 0) {*/
     /*        ret |= (1 << i);*/
@@ -347,7 +391,7 @@ int Table1_get_batch4(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[4], 
     return ret;
 #else
 
-    int ret = 0;
+    u8 ret = 0;
     u32 i;
     Table1Bucket* b0, *b1, *b2, *b3;
     __m256 c0, c1, c2, c3;
@@ -627,8 +671,8 @@ int main() {
     printf("alignof(Table1Bucket) = %ld\n", _Alignof(Table1Bucket));
     printf("alignof(Table2Bucket) = %ld\n", _Alignof(Table2Bucket));
 
-#ifndef NDEBUG
-        const size_t rounds = 8000;
+#ifdef NDEBUG
+        const size_t rounds = 10000;
 #else
         const size_t rounds = 10;
 #endif
@@ -657,7 +701,7 @@ int main() {
 #ifndef NDEBUG
         for (size_t i = 0; i < got_entries; i++) {
             u64 value;
-            int ret = Table1_get(table, n_bits, H, keys[i], &value);
+            u8 ret = Table1_get(table, n_bits, H, keys[i], &value);
             assert(ret == 0);
             assert((u64)keys[i] == value);
         }
@@ -666,8 +710,10 @@ int main() {
         size_t n_missing = 100000;
         for (u32 key = 1; key < U32_MAX; key++) {
             u64 value;
-            int ret = Table1_get(table, n_bits, H, key, &value);
+            u8 ret = Table1_get(table, n_bits, H, key, &value);
             if (ret != 0) {
+                if (value != 0xff) { printf("value = %lx\n", value); }
+                assert(value == 0xff);
                 n_missing -= 1;
                 if (n_missing == 0) {
                     break;
@@ -687,7 +733,7 @@ int main() {
 #pragma unroll 1
                 for (size_t i = 0; i < got_entries; i++) {
                     u64 value;
-                    int ret = Table1_get(table, n_bits, H, keys[i], &value);
+                    u8 ret = Table1_get(table, n_bits, H, keys[i], &value);
                     present |= ret;
                     check += value;
                 }
@@ -711,7 +757,7 @@ int main() {
                     lookups += 2;
                     u64 value[2];
                     u32 k[2] = {keys[i], keys[i + 1]};
-                    int ret = Table1_get_batch2(table, n_bits, H, k, value);
+                    u8 ret = Table1_get_batch2(table, n_bits, H, k, value);
                     present |= ret;
                     check += value[0];
                     check += value[1];
@@ -736,7 +782,7 @@ int main() {
                     lookups += 4;
                     u64 value[4];
                     u32 k[4] = {keys[i], keys[i + 1], keys[i + 2], keys[i + 4]};
-                    int ret = Table1_get_batch4(table, n_bits, H, k, value);
+                    u8 ret = Table1_get_batch4(table, n_bits, H, k, value);
                     present |= ret;
                     check += value[0];
                     check += value[1];
@@ -772,7 +818,7 @@ int main() {
 #ifndef NDEBUG
         for (size_t i = 0; i < got_entries; i++) {
             u64 value;
-            int ret = Table2_get(table, n_bits, H, keys[i], &value);
+            u8 ret = Table2_get(table, n_bits, H, keys[i], &value);
             assert(ret == 0);
             assert((u64)keys[i] == value);
         }
@@ -787,7 +833,7 @@ int main() {
 #pragma unroll 1
             for (size_t i = 0; i < got_entries; i++) {
                 u64 value;
-                int ret = Table2_get(table, n_bits, H, keys[i], &value);
+                u8 ret = Table2_get(table, n_bits, H, keys[i], &value);
                 present |= ret;
                 check += value;
             }
