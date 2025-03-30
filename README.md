@@ -12,7 +12,7 @@ Table1Bucket* bucket = (Table1Bucket*)((char*)table + hash1(key, n_bits, H)); //
 ```
 
 ```asm
-# version a: key in ecx, rdx has hash constant, rbs ix table base pointer
+# version a: key in ecx, rdx has hash constant, rbx is table base pointer
 imul    rdx, rcx
 vmovd   xmm0, ecx
 vpbroadcastd    ymm0, xmm0

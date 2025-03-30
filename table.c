@@ -30,7 +30,8 @@ static u64 elapsed_ns(Timespec start, Timespec stop) {
 // https://arxiv.org/pdf/1504.06804
 // hashes x universally into l<=64 bits using random odd seed a.
 u64 hash1(u64 x, u64 l, u64 H[2]) {
-    u64 a = H[0];
+    //u64 a = H[0];
+    u32 a = H[0];
     u64 b = H[1];
     /*u64 a = 0x9e3779b97f4a7c15;*/
     /*return (a*x) >> (64-l);*/
@@ -223,9 +224,28 @@ int Table1_get(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key, u64* value
     /**value = bucket->value[idx];*/
     /*return 0;*/
 
-    u32 i = _tzcnt_u32(ymm_entry_cmp(bucket->kv, key));
-    value[0] = bucket->value[i]; // might read garbage
-    return i >> 5; // if i == 32, this ors in a 1, but if in 0-7, ors in a zero
+    /*u32 i = _tzcnt_u32(ymm_entry_cmp(bucket->kv, key));*/
+    /*value[0] = bucket->value[i]; // might read garbage*/
+    /*return i >> 5; // if i == 32, this ors in a 1, but if in 0-7, ors in a zero*/
+
+    u32 cmp = ymm_entry_cmp(bucket->kv, key);
+    /*u32 i = _tzcnt_u32(cmp);*/
+    u32 i;
+    // jc makes the most logical sense but jb is equivalent and is what clang produces
+    // (I think)
+    asm goto (
+            "tzcnt %1, %0\n"
+            "jc %l[carry]"
+            : "=r" (i) // outputs
+            : "r" (cmp) // inputs
+            : "cc" // clobbers
+            : carry
+            );
+    /*if (i == 32) { return 1; }*/
+    value[0] = bucket->value[i];
+    return 0;
+carry:
+    return 1;
 }
 
 int Table1_get_batch2(Table1Bucket* table, size_t n_bits, u64 H[2], u32 key[2], u64 value[2]) {
