@@ -27,6 +27,41 @@ static u64 elapsed_ns(Timespec start, Timespec stop) {
   return (u64)(stop.tv_sec - start.tv_sec) * BILLION + (u64)(stop.tv_nsec - start.tv_nsec);
 }
 
+typedef struct {
+    double avg, median;
+    u64 sum, min, max, p90, p95, p99;
+} Stats;
+
+static int u64_cmp(const void* pa, const void* pb) {
+    u64 a = *(u64*)pa;
+    u64 b = *(u64*)pb;
+    if (a == b) return 0;
+    return a < b ? -1 : 1;
+}
+
+// we do about 10k rounds at ~ 20k ns per round so no chance of overflow
+static Stats timing_stats(u64* xs, size_t n) {
+    u64 sum = 0;
+    for (size_t i = 0; i < n; i++) {
+        sum += xs[i];
+    }
+    qsort(xs, n, sizeof(u64), u64_cmp);
+    u64 min = xs[0];
+    u64 max = xs[n-1];
+    double mid = n % 2 == 0 ? ((double)xs[n/2-1] + (double)xs[n/2])/2 : xs[n/2];
+    u64 p90 = xs[(size_t)((double)n*.90)];
+    u64 p95 = xs[(size_t)((double)n*.95)];
+    u64 p99 = xs[(size_t)((double)n*.99)];
+    return (Stats){
+        .sum=sum,
+        .avg=(double)sum/n,
+        .min=(double)min,
+        .max=(double)max,
+        .median=mid,
+        .p90=p90, .p95=p95, .p99=p99,
+    };
+}
+
 // https://arxiv.org/pdf/1504.06804
 // hashes x universally into l<=64 bits using random odd seed a.
 u64 hash1(u64 x, u64 l, u64 H[2]) {
@@ -677,6 +712,8 @@ int main() {
         const size_t rounds = 10;
 #endif
 
+    u64* times = malloc(sizeof(u64) * rounds);
+
     size_t tries = 10000;
     size_t target_size = 1ll << 14;
     size_t table_1_bits = __builtin_ctz(target_size / 8);
@@ -727,9 +764,9 @@ int main() {
             u64 present = 0;
             Timespec start, stop;
 
-            clock_ns(&start);
 #pragma unroll 1
             for (size_t round = 0; round < rounds; round++) {
+                clock_ns(&start);
 #pragma unroll 1
                 for (size_t i = 0; i < got_entries; i++) {
                     u64 value;
@@ -737,10 +774,13 @@ int main() {
                     present |= ret;
                     check += value;
                 }
+                clock_ns(&stop);
+                times[round] = elapsed_ns(start, stop);
             }
-            clock_ns(&stop);
 
-            printf("%.2f ns/lookup %ld lookups (1) %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)rounds / (double)got_entries, rounds * got_entries, (double)elapsed_ns(start, stop) / 1000000, present, check);
+            Stats stats = timing_stats(times, rounds);
+            double d = got_entries;
+            printf("%.2f ns/lookup (min=%.2f max=%.2f median=%.2f p90=%.2f p95=%.2f p99=%.2f) %ld lookups (1) %.2f ms present=%ld check=%lx\n", stats.avg/d, stats.min/d, stats.max/d, stats.median/d, stats.p90/d, stats.p95/d, stats.p99/d, rounds * got_entries, (double)stats.sum / 1000000, present, check);
         }
 
         {
@@ -749,9 +789,9 @@ int main() {
             Timespec start, stop;
             size_t lookups = 0;
 
-            clock_ns(&start);
 #pragma unroll 1
             for (size_t round = 0; round < rounds; round++) {
+                clock_ns(&start);
 #pragma unroll 1
                 for (size_t i = 0; i < got_entries - 2; i += 2) {
                     lookups += 2;
@@ -762,10 +802,13 @@ int main() {
                     check += value[0];
                     check += value[1];
                 }
+                clock_ns(&stop);
+                times[round] = elapsed_ns(start, stop);
             }
-            clock_ns(&stop);
 
-            printf("%.2f ns/lookup %ld lookups (2) %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)lookups, lookups, (double)elapsed_ns(start, stop) / 1000000, present, check);
+            Stats stats = timing_stats(times, rounds);
+            double d = got_entries;
+            printf("%.2f ns/lookup (min=%.2f max=%.2f median=%.2f p90=%.2f p95=%.2f p99=%.2f) %ld lookups (2) %.2f ms present=%ld check=%lx\n", stats.avg/d, stats.min/d, stats.max/d, stats.median/d, stats.p90/d, stats.p95/d, stats.p99/d, rounds * got_entries, (double)stats.sum / 1000000, present, check);
         }
 
         {
@@ -774,9 +817,9 @@ int main() {
             Timespec start, stop;
             size_t lookups = 0;
 
-            clock_ns(&start);
 #pragma unroll 1
             for (size_t round = 0; round < rounds; round++) {
+                clock_ns(&start);
 #pragma unroll 1
                 for (size_t i = 0; i < got_entries - 4; i += 4) {
                     lookups += 4;
@@ -789,10 +832,13 @@ int main() {
                     check += value[2];
                     check += value[3];
                 }
+                clock_ns(&stop);
+                times[round] = elapsed_ns(start, stop);
             }
-            clock_ns(&stop);
+            Stats stats = timing_stats(times, rounds);
+            double d = got_entries;
+            printf("%.2f ns/lookup (min=%.2f max=%.2f median=%.2f p90=%.2f p95=%.2f p99=%.2f) %ld lookups (4) %.2f ms present=%ld check=%lx\n", stats.avg/d, stats.min/d, stats.max/d, stats.median/d, stats.p90/d, stats.p95/d, stats.p99/d, rounds * got_entries, (double)stats.sum / 1000000, present, check);
 
-            printf("%.2f ns/lookup %ld lookups (4) %.2f ms present=%ld check=%lx\n", (double)elapsed_ns(start, stop) / (double)lookups, lookups, (double)elapsed_ns(start, stop) / 1000000, present, check);
         }
 
         free(keys);
@@ -845,5 +891,6 @@ int main() {
         free(table);
     }
 
+    free(times);
 
 }

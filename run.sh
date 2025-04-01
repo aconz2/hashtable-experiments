@@ -6,4 +6,4 @@ CC=${CC:-clang}
 
 $CC -DNDEBUG -g -Wall -march=native -O2 table.c -o table
 
-taskset -c 30 ./table
+taskset -c 3 ./table
